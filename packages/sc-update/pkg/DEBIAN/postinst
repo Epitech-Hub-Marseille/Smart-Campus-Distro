@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        mkdir -p /var/lib/sc-update /etc/sc-update
+        # Empty version file = nothing installed yet; first run will update.
+        [ -f /etc/sc-update/version ] || : > /etc/sc-update/version
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        systemctl enable sc-update.service || true
+        ;;
+esac
+
+exit 0

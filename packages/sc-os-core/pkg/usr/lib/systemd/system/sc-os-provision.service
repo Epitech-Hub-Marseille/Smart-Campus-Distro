@@ -1,0 +1,12 @@
+[Unit]
+Description=Smart Campus first-boot provisioning
+After=local-fs.target
+Before=sc-update.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/sc-os/provision
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+CLAUDE.md
+.claude/settings.local.json
+build/
+out/
+sc-os.conf
+__pycache__/
+*.deb

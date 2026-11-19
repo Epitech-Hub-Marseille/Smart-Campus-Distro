@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl stop sc-update.service || true
+        fi
+        if [ "$1" = "remove" ]; then
+            systemctl disable sc-update.service || true
+        fi
+        ;;
+esac
+
+exit 0

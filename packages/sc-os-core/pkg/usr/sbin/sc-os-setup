@@ -1,0 +1,75 @@
+#!/bin/sh
+# Setup of the product installed on this machine.
+#   faculty-screen: sc-os-setup [server-url]
+#   central-server: sc-os-setup   (shows where the first admin login is)
+set -eu
+
+CONFIG_DIR=/etc/sc-os
+FACULTY_ENV="$CONFIG_DIR/faculty-screen.env"
+SERVER_ENV="$CONFIG_DIR/central-server.env"
+CURL_TIMEOUT_SECONDS=10
+
+# shellcheck source=/dev/null
+. "$CONFIG_DIR/product"
+
+fail() {
+  echo "sc-os-setup: $*" >&2
+  exit 1
+}
+
+ask() {
+  printf '%s' "$1" >&2
+  read -r answer
+  printf '%s' "$answer"
+}
+
+# fetch_server_key <server-url>: prints the JSON {publicKey, fingerprint} of the server.
+fetch_server_key() {
+  curl --fail --silent --show-error --max-time "$CURL_TIMEOUT_SECONDS" "$1/api/server-key" ||
+    fail "cannot reach $1/api/server-key, check the address and that the server is running"
+}
+
+json_field() {
+  # json_field <field>: reads a JSON object on stdin.
+  python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"
+}
+
+setup_faculty_screen() {
+  [ "$(id -u)" -eq 0 ] || fail "run as root: sudo sc-os-setup"
+  server_url="${1:-$(ask 'Central server address (e.g. http://192.168.1.10:3000): ')}"
+  server_url="${server_url%/}"
+  [ -n "$server_url" ] || fail "a server address is required"
+
+  reply="$(fetch_server_key "$server_url")"
+  public_key="$(printf '%s' "$reply" | json_field publicKey)" || fail "unexpected reply from the server"
+  fingerprint="$(printf '%s' "$reply" | json_field fingerprint)"
+
+  echo "Server key fingerprint: $fingerprint"
+  echo "Compare it with the one shown in the console (Devices, Provision a device)."
+  [ "$(ask 'Does it match? [y/N] ')" = y ] || fail "cancelled, nothing was written"
+
+  device_name="$(ask "Name of this screen [$(hostname)]: ")"
+  umask 077
+  cat >"$FACULTY_ENV" <<ENV
+SERVER_URL=$server_url
+SERVER_PUBLIC_KEY=$public_key
+DEVICE_NAME=${device_name:-$(hostname)}
+DISPLAY_PORT=3000
+ENV
+  echo "Written $FACULTY_ENV, starting the update service."
+  systemctl start --no-block sc-update.service
+  echo "The screen shows its own fingerprint: approve it in the console (Devices)."
+}
+
+show_central_server() {
+  [ -f "$SERVER_ENV" ] || fail "$SERVER_ENV does not exist yet, wait for the first boot to finish"
+  echo "Settings and first admin login: $SERVER_ENV (readable by root only)."
+  echo "Console: $(grep '^APP_URL=' "$SERVER_ENV" 2>/dev/null | cut -d= -f2-)"
+  echo "Edit the file, then run: sc-os-apply"
+}
+
+case "$PRODUCT" in
+  faculty-screen) setup_faculty_screen "$@" ;;
+  central-server) show_central_server ;;
+  *) fail "unknown product '$PRODUCT' in $CONFIG_DIR/product" ;;
+esac

@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+esac
+
+if [ "$1" = "purge" ]; then
+    rm -f /etc/sc-update/version
+    rmdir /etc/sc-update 2>/dev/null || true
+    rm -rf /var/lib/sc-update
+    # /opt/smart-campus is intentionally left untouched.
+fi
+
+exit 0

@@ -1,0 +1,216 @@
+// bootlog.script - Plymouth theme
+// Left column: logo + progress bar (green at boot, orange during system updates,
+//              hidden at shutdown/reboot) + LUKS prompt
+// Right column: scrolling list of what systemd started
+
+Window.SetBackgroundTopColor(0.06, 0.06, 0.08);
+Window.SetBackgroundBottomColor(0.06, 0.06, 0.08);
+
+W = Window.GetWidth();
+H = Window.GetHeight();
+font = "Sans 11";
+left_w = W * 0.4;                         // left column = 40% of screen
+
+
+// ---------- Logo (upper middle left) ----------
+logo_raw = Image("logo.png");
+
+max_w = left_w * 0.5;
+max_h = H * 0.28;
+
+scale = Math.Min(max_w / logo_raw.GetWidth(), max_h / logo_raw.GetHeight());
+if (scale > 1) scale = 1;
+
+logo_img = logo_raw.Scale(logo_raw.GetWidth() * scale, logo_raw.GetHeight() * scale);
+logo = Sprite(logo_img);
+logo.SetPosition(left_w / 2 - logo_img.GetWidth() / 2,
+                 H * 0.38 - logo_img.GetHeight() / 2, 1);
+
+
+// ---------- Progress bar ----------
+bar_w = left_w * 0.6;
+bar_h = 8;
+bar_x = left_w / 2 - bar_w / 2;
+bar_y = H * 0.68;
+
+bar_bg = Sprite(Image("bar_bg.png").Scale(bar_w, bar_h));
+bar_bg.SetPosition(bar_x, bar_y, 1);
+
+boot_fg_img = Image("bar_fg.png");        // green  (#00a86b)
+boot_fg = Sprite();
+boot_fg.SetPosition(bar_x, bar_y, 2);
+
+upd_fg_img = Image("bar_update.png");     // orange (#ff8c00)
+upd_fg = Sprite();
+upd_fg.SetPosition(bar_x, bar_y, 2);
+
+bar_text = Sprite();
+bar_text.SetPosition(bar_x, bar_y + 18, 2);
+
+fun set_bar(spr, img, fraction) {
+  if (fraction < 0) fraction = 0;
+  if (fraction > 1) fraction = 1;
+  w = Math.Int(bar_w * fraction);
+  if (w < 1) w = 1;
+  spr.SetImage(img.Scale(w, bar_h));
+}
+
+fun set_bar_text(text, r, g, b) {
+  bar_text.SetImage(Image.Text(text, r, g, b, 1, font));
+}
+
+fun is_update_mode(m) {
+  if (m == "updates" || m == "system-upgrade" || m == "firmware-upgrade") return 1;
+  return 0;
+}
+
+fun is_shutdown_mode(m) {
+  if (m == "shutdown" || m == "reboot") return 1;
+  return 0;
+}
+
+// Show/hide the right bar for the current mode
+fun apply_mode(m) {
+  global.mode = m;
+
+  if (is_shutdown_mode(m)) {
+    bar_bg.SetOpacity(0);
+    boot_fg.SetOpacity(0);
+    upd_fg.SetOpacity(0);
+    bar_text.SetOpacity(0);
+  } else if (is_update_mode(m)) {
+    bar_bg.SetOpacity(1);
+    boot_fg.SetOpacity(0);                // hide the boot bar
+    upd_fg.SetOpacity(1);
+    bar_text.SetOpacity(1);
+    set_bar(upd_fg, upd_fg_img, global.update_progress);
+    set_bar_text("Installing updates  " + Math.Int(global.update_progress * 100) + "%",
+                 1.0, 0.55, 0.0);
+  } else {
+    bar_bg.SetOpacity(1);
+    boot_fg.SetOpacity(1);
+    upd_fg.SetOpacity(0);
+    bar_text.SetOpacity(1);
+  }
+}
+
+global.update_progress = 0;
+global.polled_mode = Plymouth.GetMode();
+apply_mode(global.polled_mode);
+
+// Normal boot progress (Plymouth's estimate)
+fun progress_cb(duration, progress) {
+  if (is_shutdown_mode(global.mode) || is_update_mode(global.mode)) return;
+  set_bar(boot_fg, boot_fg_img, progress);
+  set_bar_text("" + Math.Int(progress * 100) + "%", 0.6, 0.6, 0.65);
+}
+Plymouth.SetBootProgressFunction(progress_cb);
+
+// Progress sent by an updater:  plymouth system-update --progress=N  (0-100)
+fun system_update_cb(progress) {
+  global.update_progress = progress / 100;
+  if (is_update_mode(global.mode)) apply_mode(global.mode);
+  else apply_mode("updates");             // switch to orange even if mode wasn't changed
+}
+Plymouth.SetSystemUpdateFunction(system_update_cb);
+
+// Pick up "plymouth change-mode ..." while running (checked ~2x per second)
+global.frame = 0;
+fun refresh_cb() {
+  global.frame++;
+  if (global.frame % 25 == 0) {
+    m = Plymouth.GetMode();
+    if (m != global.polled_mode) {
+      global.polled_mode = m;
+      apply_mode(m);
+    }
+  }
+}
+Plymouth.SetRefreshFunction(refresh_cb);
+
+
+// ---------- Systemd log (middle right) ----------
+log_x    = W * 0.45;
+log_top  = H * 0.10;
+line_h   = 22;
+max_lines = Math.Int((H * 0.80) / line_h);
+text_off = 90;                            // room for the "[  OK  ]" tag
+
+ok_img   = Image.Text("[  OK  ]", 0.35, 0.85, 0.35, 1, font);
+info_img = Image.Text("[ INFO ]", 0.90, 0.75, 0.30, 1, font);
+
+for (i = 0; i < max_lines; i++) {
+  lines[i] = "";
+  kinds[i] = 0;
+  tag_spr[i] = Sprite();
+  tag_spr[i].SetPosition(log_x, log_top + i * line_h, 1);
+  txt_spr[i] = Sprite();
+  txt_spr[i].SetPosition(log_x + text_off, log_top + i * line_h, 1);
+}
+
+fun add_line(text, kind) {
+  for (i = 0; i < max_lines - 1; i++) {   // scroll everything up one line
+    lines[i] = lines[i + 1];
+    kinds[i] = kinds[i + 1];
+  }
+  lines[max_lines - 1] = text;
+  kinds[max_lines - 1] = kind;
+
+  for (i = 0; i < max_lines; i++) {
+    if (lines[i] != "") {
+      a = 0.25 + 0.75 * (i + 1) / max_lines;      // older lines fade out
+      if (kinds[i] == 1) tag_spr[i].SetImage(ok_img);
+      else               tag_spr[i].SetImage(info_img);
+      tag_spr[i].SetOpacity(a);
+      txt_spr[i].SetImage(Image.Text(lines[i], 0.85, 0.85, 0.88, 1, font));
+      txt_spr[i].SetOpacity(a);
+    }
+  }
+}
+
+fun status_cb(text)  { add_line(text, 1); }   // unit names from systemd / updater
+fun message_cb(text) { add_line(text, 2); }   // fsck, updater messages, etc.
+Plymouth.SetUpdateStatusFunction(status_cb);
+Plymouth.SetMessageFunction(message_cb);
+
+
+// ---------- LUKS password prompt ----------
+pw_w = bar_w;
+pw_h = 32;
+pw_x = bar_x;
+pw_y = bar_y + 70;
+
+pw_box_img = Image("bar_bg.png").Scale(pw_w, pw_h);
+pw_label_img = Image.Text("Enter disk passphrase", 0.85, 0.85, 0.88, 1, font);
+
+pw_box = Sprite();
+pw_box.SetPosition(pw_x, pw_y, 3);
+pw_label = Sprite();
+pw_label.SetPosition(pw_x, pw_y - 24, 4);
+pw_dots = Sprite();
+pw_dots.SetPosition(pw_x + 10, pw_y + 6, 4);
+
+fun password_cb(prompt, bullets) {
+  pw_box.SetImage(pw_box_img);
+  pw_label.SetImage(pw_label_img);
+  pw_box.SetOpacity(1);
+  pw_label.SetOpacity(1);
+
+  if (bullets > 0) {
+    s = "";
+    for (i = 0; i < bullets && i < 30; i++) s = s + "*";
+    pw_dots.SetImage(Image.Text(s, 0, 0.66, 0.42, 1, "Sans Bold 14"));   // #00a86b
+    pw_dots.SetOpacity(1);
+  } else {
+    pw_dots.SetOpacity(0);
+  }
+}
+
+fun normal_cb() {
+  pw_box.SetOpacity(0);
+  pw_label.SetOpacity(0);
+  pw_dots.SetOpacity(0);
+}
+
+Plymouth.SetDisplayPasswordFunction(password_cb);
+Plymouth.SetDisplayNormalFunction(normal_cb);

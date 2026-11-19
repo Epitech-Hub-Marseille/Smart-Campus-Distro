@@ -1,0 +1,13 @@
+Package: sc-update
+Version: 1.0.0
+Section: admin
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.8), python3-yaml, git, openssh-client, systemd
+Recommends: plymouth, docker.io | docker-ce, docker-compose-v2 | docker-compose-plugin
+Maintainer: Smart Campus <admin@example.com>
+Description: Smart Campus system updater
+ Checks the latest tag on the main branch of the repository in
+ /opt/smart-campus against /etc/sc-update/version and, automatically or after
+ asking the user (Plymouth and shell), updates it and rebuilds and starts the
+ docker compose project. Runs at boot as a systemd service.

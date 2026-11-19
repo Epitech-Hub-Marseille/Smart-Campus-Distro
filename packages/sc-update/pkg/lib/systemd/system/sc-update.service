@@ -1,0 +1,18 @@
+[Unit]
+Description=Smart Campus update service
+Wants=network-online.target docker.service
+After=network-online.target docker.service plymouth-start.service
+Before=plymouth-quit.service
+ConditionPathExists=/bin/sc-update/sc-update
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sc-update/sc-update
+# Docker builds and the conditional prompt can take a while.
+TimeoutStartSec=infinity
+SyslogIdentifier=sc-update
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

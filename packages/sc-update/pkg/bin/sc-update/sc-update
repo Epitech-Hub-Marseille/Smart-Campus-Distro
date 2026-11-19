@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""sc-update - Smart Campus updater.
+
+Compares the tag stored in /etc/sc-update/version with the latest tag on the
+`main` branch of the git repository in /opt/smart-campus. If they differ, the
+update is applied automatically or after asking the user (via Plymouth and the
+shell/console), then the docker compose project is rebuilt and started.
+
+Exit codes:
+  0  up to date, updated successfully, or update cancelled (not an error)
+  1  failure (could not check, or the update failed)
+"""
+from __future__ import annotations
+
+import fcntl
+import logging
+import os
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import time
+from pathlib import Path
+from typing import Optional
+
+import yaml
+
+CONFIG_PATH = Path("/etc/sc-update/config.yaml")
+VERSION_PATH = Path("/etc/sc-update/version")
+# Not /bin: it is a symlink to /usr/bin on Debian and must not hold mutable data.
+REPO_DIR = Path("/opt/smart-campus")
+STATE_DIR = Path("/var/lib/sc-update")
+OVERRIDE_PATH = STATE_DIR / "restart-override.yml"
+LOCK_PATH = Path("/run/sc-update.lock")
+DEPLOY_KEY_PATH = Path("/etc/sc-os/deploy-key")
+KNOWN_HOSTS_PATH = STATE_DIR / "known_hosts"
+SHORT_SHA_LENGTH = 12
+GIT_TIMEOUT_SECONDS = 120
+BRANCH = "main"
+COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+
+DEFAULT_AUTO_UPDATE = True
+DEFAULT_AUTOREJECT_SECONDS = 15
+
+log = logging.getLogger("sc-update")
+
+
+class UpdateFailed(Exception):
+    """A real failure (as opposed to a cancelled update)."""
+
+
+# --------------------------------------------------------------------------
+# Plymouth
+# --------------------------------------------------------------------------
+class Plymouth:
+    def __init__(self) -> None:
+        self.exe = shutil.which("plymouth")
+        self._shown: Optional[str] = None
+
+    def active(self) -> bool:
+        if not self.exe:
+            return False
+        try:
+            return subprocess.run(
+                [self.exe, "--ping"], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=5,
+            ).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _call(self, *args: str) -> None:
+        try:
+            subprocess.run([self.exe, *args], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def message(self, text: str) -> None:
+        if not self.active():
+            return
+        if self._shown:
+            self._call("hide-message", f"--text={self._shown}")
+        self._call("display-message", f"--text={text}")
+        self._shown = text
+
+
+ply = Plymouth()
+
+
+def say(text: str, level: int = logging.INFO) -> None:
+    """Log to the journal and show the same text on the Plymouth splash."""
+    log.log(level, text)
+    ply.message(f"Smart Campus: {text}")
+
+
+# --------------------------------------------------------------------------
+# Config / version
+# --------------------------------------------------------------------------
+def _to_bool(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("true", "yes", "on", "1"):
+            return True
+        if s in ("false", "no", "off", "0"):
+            return False
+    log.warning("auto-update: invalid value %r, using default %s", value, default)
+    return default
+
+
+def _to_path_list(value) -> list[Path]:
+    """Accept a YAML list of paths; anything else (including missing) is empty."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        log.warning("expected a list of paths, got %r, ignoring it", value)
+        return []
+    return [Path(str(item)) for item in value]
+
+
+def load_config() -> dict:
+    raw: dict = {}
+    try:
+        with CONFIG_PATH.open() as fh:
+            raw = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        log.warning("%s not found, using defaults", CONFIG_PATH)
+    except (OSError, yaml.YAMLError) as exc:
+        raise UpdateFailed(f"cannot read {CONFIG_PATH}: {exc}")
+    if not isinstance(raw, dict):
+        raise UpdateFailed(f"{CONFIG_PATH} must contain a YAML mapping")
+
+    cfg = {
+        "auto-update": _to_bool(raw.get("auto-update", DEFAULT_AUTO_UPDATE),
+                                DEFAULT_AUTO_UPDATE),
+        "conditional-update-autoreject-seconds": float(DEFAULT_AUTOREJECT_SECONDS),
+        "repository-url": raw.get("repository-url") or None,
+        "compose-env-file": raw.get("compose-env-file") or None,
+        "compose-overrides": _to_path_list(raw.get("compose-overrides")),
+        "required-files": _to_path_list(raw.get("required-files")),
+    }
+    if "conditional-update-autoreject-seconds" in raw:
+        value = raw["conditional-update-autoreject-seconds"]
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            seconds = float(value)
+            if seconds < 0:
+                raise ValueError
+            cfg["conditional-update-autoreject-seconds"] = seconds
+        except (TypeError, ValueError):
+            log.warning("conditional-update-autoreject-seconds: invalid value %r, "
+                        "using default %s", value, DEFAULT_AUTOREJECT_SECONDS)
+    return cfg
+
+
+def read_version() -> str:
+    try:
+        return VERSION_PATH.read_text().strip()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        raise UpdateFailed(f"cannot read {VERSION_PATH}: {exc}")
+
+
+def write_version(tag: str) -> None:
+    tmp = VERSION_PATH.with_suffix(".tmp")
+    try:
+        tmp.write_text(tag + "\n")
+        os.replace(tmp, VERSION_PATH)
+    except OSError as exc:
+        raise UpdateFailed(f"cannot write {VERSION_PATH}: {exc}")
+
+
+# --------------------------------------------------------------------------
+# Git
+# --------------------------------------------------------------------------
+def git_env() -> dict:
+    """Environment for every git call: never prompt, and use the deploy key if there is one.
+
+    The deploy key lets a machine clone a private repository over ssh. The host key
+    is trusted on first use because nobody is at the console to confirm it at boot.
+    """
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    if DEPLOY_KEY_PATH.is_file():
+        env["GIT_SSH_COMMAND"] = (
+            f"ssh -i {DEPLOY_KEY_PATH} -o IdentitiesOnly=yes "
+            f"-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={KNOWN_HOSTS_PATH}")
+    return env
+
+
+def git(*args: str, check: bool = True) -> str:
+    cmd = ["git", "-c", f"safe.directory={REPO_DIR}", "-C", str(REPO_DIR), *args]
+    env = git_env()
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                             timeout=GIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # A blackholed network must not hold the boot (and the kiosk) forever.
+        raise UpdateFailed(f"git {' '.join(args)} timed out after {GIT_TIMEOUT_SECONDS}s")
+    except OSError as exc:
+        raise UpdateFailed(f"cannot run git: {exc}")
+    if res.returncode != 0 and check:
+        raise UpdateFailed(f"git {' '.join(args)} failed: {res.stderr.strip()}")
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def ensure_repo(cfg: dict) -> None:
+    if (REPO_DIR / ".git").exists():
+        return
+    url = cfg.get("repository-url")
+    if not url:
+        raise UpdateFailed(
+            f"{REPO_DIR} is not a git repository and no 'repository-url' is set "
+            f"in {CONFIG_PATH}")
+    say(f"cloning repository from {url}")
+    REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    res = subprocess.run(["git", "clone", "--branch", BRANCH, url, str(REPO_DIR)],
+                         capture_output=True, text=True, env=git_env())
+    if res.returncode != 0:
+        raise UpdateFailed(f"git clone failed: {res.stderr.strip()}")
+
+
+def latest_version() -> str:
+    """Latest tag on origin/main, or the short commit id of origin/main if it has no tag.
+
+    The fallback exists because a repository that does not tag its releases would
+    otherwise never be installed. A commit id changes on every push to main, so such
+    a machine follows main instead of releases.
+    """
+    git("fetch", "--force", "--tags", "origin",
+        f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}")
+    remote_branch = f"refs/remotes/origin/{BRANCH}"
+    tag = git("describe", "--tags", "--abbrev=0", remote_branch, check=False)
+    if tag:
+        return tag
+    return git("rev-parse", f"--short={SHORT_SHA_LENGTH}", remote_branch, check=False)
+
+
+# --------------------------------------------------------------------------
+# Asking the user (Plymouth + shell/console, first answer wins)
+# --------------------------------------------------------------------------
+def _write_console(text: str) -> None:
+    if sys.stdout.isatty():
+        print(text, flush=True)
+        return
+    try:
+        with open("/dev/console", "w") as con:
+            con.write(text + "\n")
+    except OSError:
+        pass
+
+
+def ask_user(current: str, latest: str, timeout: float) -> Optional[bool]:
+    """Return True = accepted, False = rejected, None = timed out."""
+    prompt = (f"Update available: {current or 'none'} -> {latest}. "
+              f"Install now? [y/N] (auto-cancel in {int(timeout)}s)")
+    sources: dict[int, str] = {}
+    own_fd: Optional[int] = None
+    proc: Optional[subprocess.Popen] = None
+
+    if sys.stdin.isatty():
+        sources[sys.stdin.fileno()] = "shell"
+    else:
+        try:
+            own_fd = os.open("/dev/console", os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+            sources[own_fd] = "console"
+        except OSError:
+            pass
+    for fd in list(sources):
+        try:
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except (termios.error, OSError):
+            pass
+
+    _write_console(f"[sc-update] {prompt}")
+    log.info(prompt)
+
+    if ply.active():
+        try:
+            proc = subprocess.Popen(
+                [ply.exe, "ask-question", f"--prompt={prompt}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            sources[proc.stdout.fileno()] = "plymouth"
+        except OSError:
+            proc = None
+
+    deadline = time.monotonic() + timeout
+    result: Optional[bool] = None
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not sources:          # no input channel at all: just wait it out
+                time.sleep(min(remaining, 1.0))
+                continue
+            ready, _, _ = select.select(list(sources), [], [], remaining)
+            for fd in ready:
+                try:
+                    data = os.read(fd, 1024)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    data = b""
+                if not data:
+                    sources.pop(fd, None)
+                    continue
+                answer = data.decode(errors="replace").strip().lower()
+                log.info("answer received from %s: %r", sources[fd], answer)
+                result = answer in ("y", "yes")
+                return result
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            if proc.stdout:
+                proc.stdout.close()
+        if own_fd is not None:
+            os.close(own_fd)
+    return result
+
+
+# --------------------------------------------------------------------------
+# Docker compose
+# --------------------------------------------------------------------------
+def run_streamed(cmd: list[str], cwd: Optional[Path] = None) -> None:
+    """Run a command, streaming its output into the journal."""
+    log.info("$ %s", " ".join(cmd))
+    env = {**os.environ, "COMPOSE_ANSI": "never", "BUILDKIT_PROGRESS": "plain",
+           "COMPOSE_PROGRESS": "plain", "DOCKER_CLI_HINTS": "false"}
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, errors="replace")
+    except OSError as exc:
+        raise UpdateFailed(f"cannot run {cmd[0]}: {exc}")
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line:
+            log.info("  %s", line)
+    rc = proc.wait()
+    if rc != 0:
+        raise UpdateFailed(f"`{' '.join(cmd)}` exited with status {rc}")
+
+
+def compose_base() -> list[str]:
+    if shutil.which("docker"):
+        res = subprocess.run(["docker", "compose", "version"],
+                             capture_output=True, text=True)
+        if res.returncode == 0:
+            return ["docker", "compose"]
+    if shutil.which("docker-compose"):
+        return ["docker-compose"]
+    raise UpdateFailed("docker compose is not installed")
+
+
+def compose_up(cfg: dict) -> None:
+    compose_file = next((REPO_DIR / n for n in COMPOSE_NAMES if (REPO_DIR / n).is_file()), None)
+    if compose_file is None:
+        raise UpdateFailed(f"no docker compose file found in {REPO_DIR}")
+    base = compose_base() + ["--project-directory", str(REPO_DIR), "-f", str(compose_file)]
+    if cfg["compose-env-file"]:
+        base += ["--env-file", cfg["compose-env-file"]]
+    for override in cfg["compose-overrides"]:
+        base += ["-f", str(override)]
+
+    res = subprocess.run(base + ["config", "--services"], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise UpdateFailed(f"invalid compose file: {res.stderr.strip()}")
+    services = [s.strip() for s in res.stdout.splitlines() if s.strip()]
+    if not services:
+        raise UpdateFailed("compose file defines no services")
+
+    # Force restart: always so docker keeps everything up (and brings it back
+    # after the next reboot) without touching the repository's own files.
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OVERRIDE_PATH.write_text(
+        "services:\n" + "".join(f"  {s}:\n    restart: always\n" for s in services))
+
+    run_streamed(base + ["-f", str(OVERRIDE_PATH), "up", "-d", "--build",
+                         "--remove-orphans"], cwd=REPO_DIR)
+
+
+# --------------------------------------------------------------------------
+# Update
+# --------------------------------------------------------------------------
+def apply_update(tag: str, cfg: dict) -> None:
+    previous = git("rev-parse", "HEAD", check=False)
+    try:
+        say(f"updating to {tag}")
+        # `tag` is a tag name or, for untagged repositories, a commit id: both resolve here.
+        git("checkout", "--force", "--detach", tag)
+        say(f"building and starting containers for {tag}")
+        compose_up(cfg)
+    except UpdateFailed:
+        if previous:
+            log.error("update failed, restoring previous revision %s", previous[:12])
+            try:
+                git("checkout", "--force", "--detach", previous)
+                compose_up(cfg)
+            except UpdateFailed as exc:
+                log.error("rollback also failed: %s", exc)
+        raise
+    write_version(tag)
+    say(f"updated to {tag}")
+
+
+def run() -> int:
+    cfg = load_config()
+    ensure_repo(cfg)
+
+    missing = [str(p) for p in cfg["required-files"] if not p.is_file()]
+    if missing:
+        # Not a failure: a freshly installed machine waits for `sc-os-setup`,
+        # which starts this service again once the files exist.
+        say("waiting for setup, missing " + ", ".join(missing))
+        return 0
+
+    current = read_version()
+    say("checking for updates")
+    latest = latest_version()
+    if not latest:
+        log.warning("no commits found on %s, nothing to update to", BRANCH)
+        return 0
+    if latest == current:
+        say(f"up to date ({current})")
+        return 0
+
+    log.info("version mismatch: installed=%r latest=%r", current or "none", latest)
+
+    if not cfg["auto-update"]:
+        timeout = cfg["conditional-update-autoreject-seconds"]
+        answer = ask_user(current, latest, timeout)
+        if answer is None:
+            say("update cancelled (no answer before timeout)")
+            return 0
+        if not answer:
+            say("update cancelled by user")
+            return 0
+
+    apply_update(latest, cfg)
+    return 0
+
+
+def main() -> int:
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
+    if os.geteuid() != 0:
+        log.error("must be run as root")
+        return 1
+    lock = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.info("another sc-update instance is running, exiting")
+        return 0
+    try:
+        return run()
+    except UpdateFailed as exc:
+        say(f"UPDATE FAILED: {exc}", logging.ERROR)
+        return 1
+    except Exception:  # noqa: BLE001
+        log.exception("unexpected error")
+        ply.message("Smart Campus: UPDATE FAILED (unexpected error)")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

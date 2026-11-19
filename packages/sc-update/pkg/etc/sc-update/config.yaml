@@ -1,0 +1,26 @@
+# sc-update configuration
+# The image build overwrites this file with the values of the chosen product.
+
+# true  = update automatically at startup when the installed version differs from
+#         the latest tag on main (or the latest commit of main when untagged).
+# false = ask the user (Plymouth + shell/console) before updating.
+auto-update: true
+
+# Only used when auto-update is false: seconds to wait for an answer before
+# the update is cancelled (a cancelled update is not an error).
+conditional-update-autoreject-seconds: 15
+
+# Cloned to /opt/smart-campus when it is not there yet. For a private repository
+# use an ssh URL and put a read-only deploy key in /etc/sc-os/deploy-key (mode 0600).
+# repository-url: https://github.com/example/example.git
+
+# Passed to `docker compose --env-file`.
+# compose-env-file: /etc/sc-os/product.env
+
+# Extra compose files merged after the repository's own.
+# compose-overrides:
+#   - /usr/lib/sc-os/compose-override.yml
+
+# The update waits (without failing) until these files exist.
+# required-files:
+#   - /etc/sc-os/product.env

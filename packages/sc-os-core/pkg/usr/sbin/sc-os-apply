@@ -1,0 +1,17 @@
+#!/bin/sh
+# Apply a changed settings file to the running stack, without waiting for a new release.
+set -eu
+
+[ "$(id -u)" -eq 0 ] || { echo "sc-os-apply: run as root" >&2; exit 1; }
+
+# shellcheck source=/dev/null
+. /etc/sc-os/product
+REPO_DIR=/opt/smart-campus
+
+# Same files as sc-update uses: the repository's compose file, then the product's own.
+set -- --project-directory "$REPO_DIR" --env-file "/etc/sc-os/$PRODUCT.env"
+for file in "$REPO_DIR/docker-compose.yml" "/usr/lib/sc-os/$PRODUCT.override.yml" \
+            /var/lib/sc-update/restart-override.yml; do
+  [ -f "$file" ] && set -- "$@" -f "$file"
+done
+exec docker compose "$@" up -d
