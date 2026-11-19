@@ -4,7 +4,7 @@ Section: admin
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.8), python3-yaml, git, openssh-client, systemd
-Recommends: plymouth, docker.io | docker-ce, docker-compose-v2 | docker-compose-plugin
+Recommends: plymouth, docker.io | docker-ce, docker-compose | docker-compose-v2 | docker-compose-plugin
 Maintainer: Smart Campus <admin@example.com>
 Description: Smart Campus system updater
  Checks the latest tag on the main branch of the repository in

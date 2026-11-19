@@ -302,7 +302,7 @@ pkg_core() {
   fi
   find "$P" -type d -exec chmod 0755 {} +
   chmod 0755 "$P/DEBIAN/postinst" "$P"/usr/sbin/* "$P/usr/libexec/sc-os/provision"
-  ctl "$P" sc-os-core "docker.io, docker-compose-v2, openssl, python3, curl, sc-update (= $VERSION)" \
+  ctl "$P" sc-os-core "docker.io, docker-compose, openssl, python3, curl, sc-update (= $VERSION)" \
     "$OS_NAME core for the $PRODUCT_TITLE (docker, provisioning, setup)"
   build_deb "$P"
 }
