@@ -7,8 +7,11 @@ followed the product repository. Machines also showed nothing while an update
 ran.
 
 ## Decision
-- Every commit on main of this repository gets the tag `v<major>.<minor>.<patch>`
-  (`.github/workflows/tag.yml`, `tools/next_version.py`). `<major>.<minor>` is the
+- Every commit on main of this repository gets a release `v<major>.<minor>.<patch>`
+  (`.github/workflows/release.yml`, `tools/next_version.py`) with the update ISO of
+  each product attached. The tag is created by the release, after the tests and
+  the ISO builds passed, so a failed build leaves no tag. One release per commit
+  is noisy, and is accepted so that every version has its ISO. `<major>.<minor>` is the
   `VERSION` file, `<patch>` the number of commits since that file last changed.
   Counting commits, not tags, gives one number per commit even when several are
   pushed together, and bumping `VERSION` restarts at 0. Tests run before tagging.

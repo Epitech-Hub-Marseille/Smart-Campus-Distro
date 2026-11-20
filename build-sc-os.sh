@@ -30,9 +30,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF="${SC_CONF:-$ROOT/sc-os.conf}"
 
+# The version CI would give the current commit (tools/next_version.py), so a local
+# build and the release of the same commit carry the same number. Without git history
+# (a source tarball), the VERSION file with patch 0.
+default_version() {
+  python3 "$ROOT/tools/next_version.py" 2>/dev/null ||
+    echo "$(cat "$ROOT/VERSION" 2>/dev/null || echo 0.0).0"
+}
+
 # ---------------------------------------------------------------- defaults ---
 OS_NAME="SC OS"
-VERSION="0.1.0"
+VERSION=""                         # empty: the version of the current commit, see default_version
 MAINTAINER="Smart Campus <admin@example.com>"
 DIST="trixie"
 ARCH="amd64"
@@ -57,7 +65,7 @@ BOOT_APPEND="quiet splash loglevel=3 rd.udev.log_level=3 vt.global_cursor_defaul
 # shellcheck source=/dev/null
 [[ -f "$CONF" ]] && . "$CONF"
 # sc-update builds a release on the machine and sets its version here.
-VERSION="${SC_VERSION:-$VERSION}"
+VERSION="${SC_VERSION:-${VERSION:-$(default_version)}}"
 
 PRODUCT=""                         # set by load_product
 BUILD=""

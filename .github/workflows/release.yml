@@ -1,0 +1,67 @@
+# For every commit pushed to main: run the tests, build the update ISO of each
+# product, then create the release v<major>.<minor>.<patch> (the tag is created with
+# it, see tools/next_version.py). Machines follow these tags: sc-update installs the
+# latest one. The ISOs are for machines that cannot reach it yet.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+# Two quick pushes must not compute their versions at the same time.
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the patch number counts commits, so it needs the history
+
+      - name: Tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Version
+        id: version
+        run: |
+          version="$(python3 tools/next_version.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse --verify --quiet "refs/tags/v$version" >/dev/null; then
+            echo "v$version already exists, nothing to do"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build tools
+        if: steps.version.outputs.exists == 'false'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends librsvg2-bin xorriso
+
+      - name: Build the update ISOs
+        if: steps.version.outputs.exists == 'false'
+        env:
+          SC_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for product in $(./build-sc-os.sh products); do
+            ./build-sc-os.sh update-iso "$product"
+          done
+          mkdir release
+          cp out/*/sc-os-update-*.iso release/
+          (cd release && sha256sum ./*.iso > SHA256SUMS)
+
+      # Created last, so a failed build leaves no tag behind and a re-run can retry.
+      - name: Release
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" release/* \
+            --target "$GITHUB_SHA" \
+            --title "v${{ steps.version.outputs.version }}" \
+            --notes "Update ISOs: mount one on a deployed machine and run install.sh (see the README, Updates)."

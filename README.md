@@ -45,7 +45,7 @@ and key to every screen.
 `update-iso` bundles the packages with an `install.sh`. Mount it on the machine
 (`sudo mount -o ro /dev/sr0 /mnt`), run `sudo sh /mnt/install.sh` and reboot. The
 updater only follows the product repository, so OS-level fixes reach a deployed
-machine this way. Raise `VERSION` in `sc-os.conf` first, or dpkg sees nothing new.
+machine this way. Each commit has a new version, so a build is always newer than the last. The same ISOs are attached to every GitHub release.
 
 ## Install and first boot
 
@@ -97,11 +97,15 @@ risks in [docs/decisions/0002-os-updates-and-versioning.md](docs/decisions/0002-
 
 ### Versions
 
-Every commit pushed to `main` is tagged `v<major>.<minor>.<patch>` by
-`.github/workflows/tag.yml`. `<major>.<minor>` is the `VERSION` file; `<patch>` is the
-number of commits since that file last changed. To start a new minor version, edit
+Every commit pushed to `main` gets a release `v<major>.<minor>.<patch>` from
+`.github/workflows/release.yml`, with the update ISO of each product attached
+(plus `SHA256SUMS`). The workflow runs the tests and builds the ISOs first, and the tag
+is only created with the release, so a failed build leaves nothing behind. `<major>.<minor>` is the `VERSION` file; `<patch>` is the
+number of commits since that file last changed. Local builds use the same rule, so
+`./build-sc-os.sh` on a commit gives the version its release will have (set
+`VERSION` in `sc-os.conf` or `SC_VERSION` to override). To start a new minor version, edit
 `VERSION` (for example `0.2`): the next commit is `v0.2.0`. A product repository can
-use the same workflow by copying `.github/workflows/tag.yml`, `tools/next_version.py`
+use the same workflow by copying `.github/workflows/release.yml`, `tools/next_version.py`
 and a `VERSION` file.
 
 ## Private repositories
