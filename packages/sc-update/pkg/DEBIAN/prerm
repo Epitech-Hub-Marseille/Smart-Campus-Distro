@@ -4,10 +4,10 @@ set -e
 case "$1" in
     remove|upgrade|deconfigure)
         if [ -d /run/systemd/system ]; then
-            systemctl stop sc-update.service || true
+            systemctl stop sc-update.service sc-update-check.timer || true
         fi
         if [ "$1" = "remove" ]; then
-            systemctl disable sc-update.service || true
+            systemctl disable sc-update.service sc-update-check.timer || true
         fi
         ;;
 esac

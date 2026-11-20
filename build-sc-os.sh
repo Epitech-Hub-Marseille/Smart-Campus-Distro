@@ -49,12 +49,15 @@ CHIME_DEVICE="default"             # ALSA device, e.g. plughw:0,0 or hdmi:CARD=P
 CHIME_VOLUME="70%"
 
 REPO_URL=""                        # overrides PRODUCT_REPO_URL (for example an ssh URL)
+DISTRO_REPO_URL="https://github.com/liam-colle/SmartCampus-Distro.git"  # source of OS updates
 EXTRA_PACKAGES=""                  # extra Debian packages for the image
 INSTALLER="live"                   # live-build --debian-installer: none | live
 BOOT_APPEND="quiet splash loglevel=3 rd.udev.log_level=3 vt.global_cursor_default=0"
 
 # shellcheck source=/dev/null
 [[ -f "$CONF" ]] && . "$CONF"
+# sc-update builds a release on the machine and sets its version here.
+VERSION="${SC_VERSION:-$VERSION}"
 
 PRODUCT=""                         # set by load_product
 BUILD=""
@@ -268,6 +271,7 @@ write_update_config() {
 auto-update: true
 conditional-update-autoreject-seconds: 15
 repository-url: $REPO_URL
+os-repository-url: $DISTRO_REPO_URL
 compose-env-file: /etc/sc-os/$PRODUCT.env
 required-files:
   - /etc/sc-os/$PRODUCT.env
@@ -284,9 +288,11 @@ pkg_update() {
   write_update_config "$P/etc/sc-update/config.yaml"
   sed -i "s/^Version: .*/Version: $VERSION/" "$P/DEBIAN/control"
   find "$P" -type d -exec chmod 0755 {} +
+  find "$P" -name __pycache__ -prune -exec rm -rf {} +
   chmod 0755 "$P"/DEBIAN/{postinst,prerm,postrm} "$P/bin/sc-update/sc-update"
   chmod 0644 "$P"/DEBIAN/{control,conffiles} "$P/etc/sc-update/config.yaml" \
-    "$P/lib/systemd/system/sc-update.service"
+    "$P"/bin/sc-update/*.py "$P"/lib/systemd/system/sc-update*.service \
+    "$P"/lib/systemd/system/sc-update-check.timer
   build_deb "$P"
 }
 

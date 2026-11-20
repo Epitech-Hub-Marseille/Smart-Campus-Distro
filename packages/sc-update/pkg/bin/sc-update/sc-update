@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 """sc-update - Smart Campus updater.
 
-Compares the tag stored in /etc/sc-update/version with the latest tag on the
-`main` branch of the git repository in /opt/smart-campus. If they differ, the
-update is applied automatically or after asking the user (via Plymouth and the
-shell/console), then the docker compose project is rebuilt and started.
+Two things are kept up to date:
+
+* the OS packages (sc-os-core, sc-update, ...): the latest release tag of the
+  distro repository is built on the machine and installed (see os_update.py);
+* the product: the latest tag (or latest commit, if untagged) on the `main`
+  branch of the repository in /opt/smart-campus, then the docker compose project
+  is rebuilt and started.
+
+Each update is applied automatically or after asking the user (via Plymouth and
+the shell/console). Progress is reported to Plymouth (see plymouth_report.py).
+
+  sc-update           check and apply updates (runs at boot as a systemd service)
+  sc-update --check   only check, and write /var/lib/sc-update/status.json
 
 Exit codes:
   0  up to date, updated successfully, or update cancelled (not an error)
-  1  failure (could not check, or the update failed)
+  1  failure (could not check, or an update failed)
 """
 from __future__ import annotations
 
+import argparse
 import fcntl
+import json
 import logging
 import os
 import select
@@ -21,70 +32,42 @@ import subprocess
 import sys
 import termios
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import yaml
 
+sys.dont_write_bytecode = True  # do not leave __pycache__ inside the package directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import gitrepo  # noqa: E402
+import os_update  # noqa: E402
+from gitrepo import SHORT_SHA_LENGTH, STATE_DIR  # noqa: E402,F401
+from plymouth_report import Plymouth, StepCounter, UpdateProgress  # noqa: E402
+from process import UpdateFailed, run_streamed  # noqa: E402
+
 CONFIG_PATH = Path("/etc/sc-update/config.yaml")
 VERSION_PATH = Path("/etc/sc-update/version")
+STATUS_PATH = STATE_DIR / "status.json"
 # Not /bin: it is a symlink to /usr/bin on Debian and must not hold mutable data.
 REPO_DIR = Path("/opt/smart-campus")
-STATE_DIR = Path("/var/lib/sc-update")
 OVERRIDE_PATH = STATE_DIR / "restart-override.yml"
 LOCK_PATH = Path("/run/sc-update.lock")
-DEPLOY_KEY_PATH = Path("/etc/sc-os/deploy-key")
-KNOWN_HOSTS_PATH = STATE_DIR / "known_hosts"
-SHORT_SHA_LENGTH = 12
-GIT_TIMEOUT_SECONDS = 120
-BRANCH = "main"
 COMPOSE_NAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+COMPOSE_ENV = {"COMPOSE_ANSI": "never", "BUILDKIT_PROGRESS": "plain",
+               "COMPOSE_PROGRESS": "plain", "DOCKER_CLI_HINTS": "false"}
 
 DEFAULT_AUTO_UPDATE = True
 DEFAULT_AUTOREJECT_SECONDS = 15
 
+# Share of the Plymouth bar given to each stage, when that stage runs.
+STAGE_WEIGHTS = (("os-build", 25), ("os-install", 15),
+                 ("product-checkout", 5), ("product-containers", 55))
+# build-sc-os.sh builds this many packages for a product with a screen (one less without).
+BUILD_PACKAGES_ESTIMATE = 4
+
 log = logging.getLogger("sc-update")
-
-
-class UpdateFailed(Exception):
-    """A real failure (as opposed to a cancelled update)."""
-
-
-# --------------------------------------------------------------------------
-# Plymouth
-# --------------------------------------------------------------------------
-class Plymouth:
-    def __init__(self) -> None:
-        self.exe = shutil.which("plymouth")
-        self._shown: Optional[str] = None
-
-    def active(self) -> bool:
-        if not self.exe:
-            return False
-        try:
-            return subprocess.run(
-                [self.exe, "--ping"], stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=5,
-            ).returncode == 0
-        except (OSError, subprocess.SubprocessError):
-            return False
-
-    def _call(self, *args: str) -> None:
-        try:
-            subprocess.run([self.exe, *args], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=5)
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-    def message(self, text: str) -> None:
-        if not self.active():
-            return
-        if self._shown:
-            self._call("hide-message", f"--text={self._shown}")
-        self._call("display-message", f"--text={text}")
-        self._shown = text
-
-
 ply = Plymouth()
 
 
@@ -137,6 +120,8 @@ def load_config() -> dict:
                                 DEFAULT_AUTO_UPDATE),
         "conditional-update-autoreject-seconds": float(DEFAULT_AUTOREJECT_SECONDS),
         "repository-url": raw.get("repository-url") or None,
+        "os-repository-url": raw.get("os-repository-url") or None,
+        "os-update": _to_bool(raw.get("os-update", True), True),
         "compose-env-file": raw.get("compose-env-file") or None,
         "compose-overrides": _to_path_list(raw.get("compose-overrides")),
         "required-files": _to_path_list(raw.get("required-files")),
@@ -175,36 +160,10 @@ def write_version(tag: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# Git
+# Product repository (the helpers are in gitrepo.py)
 # --------------------------------------------------------------------------
-def git_env() -> dict:
-    """Environment for every git call: never prompt, and use the deploy key if there is one.
-
-    The deploy key lets a machine clone a private repository over ssh. The host key
-    is trusted on first use because nobody is at the console to confirm it at boot.
-    """
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    if DEPLOY_KEY_PATH.is_file():
-        env["GIT_SSH_COMMAND"] = (
-            f"ssh -i {DEPLOY_KEY_PATH} -o IdentitiesOnly=yes "
-            f"-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={KNOWN_HOSTS_PATH}")
-    return env
-
-
 def git(*args: str, check: bool = True) -> str:
-    cmd = ["git", "-c", f"safe.directory={REPO_DIR}", "-C", str(REPO_DIR), *args]
-    env = git_env()
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, env=env,
-                             timeout=GIT_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        # A blackholed network must not hold the boot (and the kiosk) forever.
-        raise UpdateFailed(f"git {' '.join(args)} timed out after {GIT_TIMEOUT_SECONDS}s")
-    except OSError as exc:
-        raise UpdateFailed(f"cannot run git: {exc}")
-    if res.returncode != 0 and check:
-        raise UpdateFailed(f"git {' '.join(args)} failed: {res.stderr.strip()}")
-    return res.stdout.strip() if res.returncode == 0 else ""
+    return gitrepo.git(REPO_DIR, *args, check=check)
 
 
 def ensure_repo(cfg: dict) -> None:
@@ -216,28 +175,11 @@ def ensure_repo(cfg: dict) -> None:
             f"{REPO_DIR} is not a git repository and no 'repository-url' is set "
             f"in {CONFIG_PATH}")
     say(f"cloning repository from {url}")
-    REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    res = subprocess.run(["git", "clone", "--branch", BRANCH, url, str(REPO_DIR)],
-                         capture_output=True, text=True, env=git_env())
-    if res.returncode != 0:
-        raise UpdateFailed(f"git clone failed: {res.stderr.strip()}")
+    gitrepo.clone(url, REPO_DIR)
 
 
 def latest_version() -> str:
-    """Latest tag on origin/main, or the short commit id of origin/main if it has no tag.
-
-    The fallback exists because a repository that does not tag its releases would
-    otherwise never be installed. A commit id changes on every push to main, so such
-    a machine follows main instead of releases.
-    """
-    git("fetch", "--force", "--tags", "origin",
-        f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}")
-    remote_branch = f"refs/remotes/origin/{BRANCH}"
-    tag = git("describe", "--tags", "--abbrev=0", remote_branch, check=False)
-    if tag:
-        return tag
-    return git("rev-parse", f"--short={SHORT_SHA_LENGTH}", remote_branch, check=False)
+    return gitrepo.latest_version(REPO_DIR)
 
 
 # --------------------------------------------------------------------------
@@ -254,9 +196,9 @@ def _write_console(text: str) -> None:
         pass
 
 
-def ask_user(current: str, latest: str, timeout: float) -> Optional[bool]:
+def ask_user(label: str, current: str, latest: str, timeout: float) -> Optional[bool]:
     """Return True = accepted, False = rejected, None = timed out."""
-    prompt = (f"Update available: {current or 'none'} -> {latest}. "
+    prompt = (f"{label} update available: {current or 'none'} -> {latest}. "
               f"Install now? [y/N] (auto-cancel in {int(timeout)}s)")
     sources: dict[int, str] = {}
     own_fd: Optional[int] = None
@@ -330,26 +272,6 @@ def ask_user(current: str, latest: str, timeout: float) -> Optional[bool]:
 # --------------------------------------------------------------------------
 # Docker compose
 # --------------------------------------------------------------------------
-def run_streamed(cmd: list[str], cwd: Optional[Path] = None) -> None:
-    """Run a command, streaming its output into the journal."""
-    log.info("$ %s", " ".join(cmd))
-    env = {**os.environ, "COMPOSE_ANSI": "never", "BUILDKIT_PROGRESS": "plain",
-           "COMPOSE_PROGRESS": "plain", "DOCKER_CLI_HINTS": "false"}
-    try:
-        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, errors="replace")
-    except OSError as exc:
-        raise UpdateFailed(f"cannot run {cmd[0]}: {exc}")
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            log.info("  %s", line)
-    rc = proc.wait()
-    if rc != 0:
-        raise UpdateFailed(f"`{' '.join(cmd)}` exited with status {rc}")
-
-
 def compose_base() -> list[str]:
     if shutil.which("docker"):
         res = subprocess.run(["docker", "compose", "version"],
@@ -361,7 +283,7 @@ def compose_base() -> list[str]:
     raise UpdateFailed("docker compose is not installed")
 
 
-def compose_up(cfg: dict) -> None:
+def compose_up(cfg: dict, on_line: Optional[Callable[[str], None]] = None) -> None:
     compose_file = next((REPO_DIR / n for n in COMPOSE_NAMES if (REPO_DIR / n).is_file()), None)
     if compose_file is None:
         raise UpdateFailed(f"no docker compose file found in {REPO_DIR}")
@@ -384,21 +306,31 @@ def compose_up(cfg: dict) -> None:
     OVERRIDE_PATH.write_text(
         "services:\n" + "".join(f"  {s}:\n    restart: always\n" for s in services))
 
-    run_streamed(base + ["-f", str(OVERRIDE_PATH), "up", "-d", "--build",
-                         "--remove-orphans"], cwd=REPO_DIR)
+    run_streamed(base + ["-f", str(OVERRIDE_PATH), "up", "-d", "--build", "--remove-orphans"],
+                 cwd=REPO_DIR, extra_env=COMPOSE_ENV, on_line=on_line)
 
 
 # --------------------------------------------------------------------------
-# Update
+# Updates
 # --------------------------------------------------------------------------
-def apply_update(tag: str, cfg: dict) -> None:
+def apply_update(tag: str, cfg: dict, progress: UpdateProgress) -> None:
+    """Check out the product release and rebuild its containers; roll back if that fails."""
     previous = git("rev-parse", "HEAD", check=False)
     try:
-        say(f"updating to {tag}")
+        progress.start("product-checkout", f"updating to {tag}")
         # `tag` is a tag name or, for untagged repositories, a commit id: both resolve here.
         git("checkout", "--force", "--detach", tag)
-        say(f"building and starting containers for {tag}")
-        compose_up(cfg)
+        progress.finish(f"Product {tag} checked out")
+
+        progress.start("product-containers", f"building and starting containers for {tag}")
+        counter = StepCounter()
+
+        def on_compose_line(line: str) -> None:
+            counter.feed(line)
+            progress.set_fraction(counter.fraction())
+
+        compose_up(cfg, on_compose_line)
+        progress.finish(f"Containers running for {tag}")
     except UpdateFailed:
         if previous:
             log.error("update failed, restoring previous revision %s", previous[:12])
@@ -412,44 +344,166 @@ def apply_update(tag: str, cfg: dict) -> None:
     say(f"updated to {tag}")
 
 
-def run() -> int:
+def apply_os_update(version: str, progress: UpdateProgress) -> None:
+    """Build the OS packages of a release and install them.
+
+    No rollback: a failed build leaves the installed packages untouched, and a
+    failed install is left to dpkg. The next boot tries again.
+    """
+    progress.start("os-build", f"building system packages {version}")
+    build_counter = StepCounter(expected=BUILD_PACKAGES_ESTIMATE)
+
+    def on_build_line(line: str) -> None:
+        build_counter.feed(line)
+        progress.set_fraction(build_counter.fraction())
+
+    packages = os_update.build_packages(version, on_build_line)
+    progress.finish(f"System packages {version} built")
+
+    progress.start("os-install", f"installing system packages {version}")
+    install_counter = StepCounter(expected=len(packages))
+
+    def on_install_line(line: str) -> None:
+        install_counter.feed(line)
+        progress.set_fraction(install_counter.fraction())
+
+    os_update.install_packages(packages, on_install_line)
+    progress.finish(f"System packages {version} installed")
+    log.info("system packages updated: a new boot splash or kernel setting needs a reboot")
+
+
+def check_os(cfg: dict) -> Optional[dict]:
+    """State of the OS packages; None when OS updates are off or could not be checked.
+
+    A failed check is only logged: the product update must not depend on it.
+    """
+    url = cfg["os-repository-url"]
+    if not url or not cfg["os-update"]:
+        return None
+    installed = os_update.installed_version()
+    try:
+        latest = os_update.latest_release(url)
+    except UpdateFailed as exc:
+        log.warning("cannot check OS updates: %s", exc)
+        return None
+    return {"installed": installed, "latest": latest,
+            "update-available": bool(latest) and os_update.is_newer(latest, installed)}
+
+
+def check_product() -> dict:
+    current = read_version()
+    latest = latest_version()
+    return {"installed": current, "latest": latest,
+            "update-available": bool(latest) and latest != current}
+
+
+def write_status(os_state: Optional[dict], product_state: dict) -> None:
+    """Record what the last check found, for whoever wants to know if updates wait."""
+    status = {"checked-at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "os": os_state, "product": product_state}
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATUS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(status, indent=2) + "\n")
+    os.replace(tmp, STATUS_PATH)
+
+
+def describe(name: str, state: Optional[dict]) -> str:
+    if state is None:
+        return f"{name}: not checked"
+    verdict = "update available" if state["update-available"] else "up to date"
+    return (f"{name}: installed {state['installed'] or 'none'}, "
+            f"latest {state['latest'] or 'none'} ({verdict})")
+
+
+def wanted(cfg: dict, label: str, state: Optional[dict]) -> bool:
+    """True when the update is pending and applying it is accepted (automatically or by the user)."""
+    if state is None or not state["update-available"]:
+        return False
+    log.info("%s: installed=%r latest=%r", label, state["installed"] or "none", state["latest"])
+    if cfg["auto-update"]:
+        return True
+    answer = ask_user(label, state["installed"], state["latest"],
+                      cfg["conditional-update-autoreject-seconds"])
+    if not answer:
+        say(f"{label} update cancelled" + (" (no answer before timeout)" if answer is None else " by user"))
+    return bool(answer)
+
+
+def update_stages(with_os: bool, with_product: bool) -> list[tuple[str, int]]:
+    """The progress stages of this run, in order, so the bar fills over what is really done."""
+    kept = []
+    for name, weight in STAGE_WEIGHTS:
+        if name.startswith("os-") and with_os or name.startswith("product-") and with_product:
+            kept.append((name, weight))
+    return kept
+
+
+def run(check_only: bool = False) -> int:
     cfg = load_config()
     ensure_repo(cfg)
 
     missing = [str(p) for p in cfg["required-files"] if not p.is_file()]
-    if missing:
+    if missing and not check_only:
         # Not a failure: a freshly installed machine waits for `sc-os-setup`,
         # which starts this service again once the files exist.
         say("waiting for setup, missing " + ", ".join(missing))
         return 0
 
-    current = read_version()
-    say("checking for updates")
-    latest = latest_version()
-    if not latest:
-        log.warning("no commits found on %s, nothing to update to", BRANCH)
+    if check_only:
+        log.info("checking for updates")
+    else:
+        say("checking for updates")
+    os_state = check_os(cfg)
+    product_state = check_product()
+    write_status(os_state, product_state)
+    if check_only:
+        log.info(describe("OS packages", os_state))
+        log.info(describe("Product", product_state))
         return 0
-    if latest == current:
-        say(f"up to date ({current})")
+
+    os_pending = bool(os_state and os_state["update-available"])
+    if not os_pending and not product_state["update-available"]:
+        say(f"up to date ({product_state['installed']})")
         return 0
 
-    log.info("version mismatch: installed=%r latest=%r", current or "none", latest)
+    with_os = wanted(cfg, "OS packages", os_state)
+    with_product = wanted(cfg, "Product", product_state)
+    if not with_os and not with_product:
+        return 0  # every pending update was declined, and wanted() said so
 
-    if not cfg["auto-update"]:
-        timeout = cfg["conditional-update-autoreject-seconds"]
-        answer = ask_user(current, latest, timeout)
-        if answer is None:
-            say("update cancelled (no answer before timeout)")
-            return 0
-        if not answer:
-            say("update cancelled by user")
-            return 0
+    return apply_updates(cfg, with_os, os_state, with_product, product_state)
 
-    apply_update(latest, cfg)
-    return 0
+
+def apply_updates(cfg: dict, with_os: bool, os_state: Optional[dict],
+                  with_product: bool, product_state: dict) -> int:
+    """Run the accepted updates behind the Plymouth update bar. One failing must not stop the other."""
+    progress = UpdateProgress(ply, update_stages(with_os, with_product))
+    failures: list[str] = []
+    ply.start_updates()
+    try:
+        if with_os:
+            try:
+                apply_os_update(os_state["latest"], progress)
+            except UpdateFailed as exc:
+                say(f"SYSTEM UPDATE FAILED: {exc}", logging.ERROR)
+                failures.append(str(exc))
+        if with_product:
+            try:
+                apply_update(product_state["latest"], cfg, progress)
+            except UpdateFailed as exc:
+                say(f"PRODUCT UPDATE FAILED: {exc}", logging.ERROR)
+                failures.append(str(exc))
+    finally:
+        ply.finish_updates()
+    return 1 if failures else 0
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Smart Campus updater")
+    parser.add_argument("--check", action="store_true",
+                        help="only check for updates and write the status file")
+    args = parser.parse_args()
+
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
     if os.geteuid() != 0:
         log.error("must be run as root")
@@ -461,7 +515,7 @@ def main() -> int:
         log.info("another sc-update instance is running, exiting")
         return 0
     try:
-        return run()
+        return run(check_only=args.check)
     except UpdateFailed as exc:
         say(f"UPDATE FAILED: {exc}", logging.ERROR)
         return 1

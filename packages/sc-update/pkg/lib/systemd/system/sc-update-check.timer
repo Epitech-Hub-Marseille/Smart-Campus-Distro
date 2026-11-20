@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for Smart Campus updates every few hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

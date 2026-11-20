@@ -1,0 +1,11 @@
+[Unit]
+Description=Smart Campus update check
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/bin/sc-update/sc-update
+
+[Service]
+Type=oneshot
+# Only looks: the updates themselves are applied at boot by sc-update.service.
+ExecStart=/bin/sc-update/sc-update --check
+SyslogIdentifier=sc-update-check

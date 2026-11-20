@@ -14,6 +14,13 @@ conditional-update-autoreject-seconds: 15
 # use an ssh URL and put a read-only deploy key in /etc/sc-os/deploy-key (mode 0600).
 # repository-url: https://github.com/example/example.git
 
+# OS packages (sc-os-core, sc-update, ...) are built from this repository: the latest
+# release tag vX.Y.Z of main is built on the machine and installed. Whoever can push
+# to main of that repository gets root on the machines: protect it, or set os-update
+# to false on machines that must not follow it.
+# os-repository-url: https://github.com/example/distro.git
+# os-update: true
+
 # Passed to `docker compose --env-file`.
 # compose-env-file: /etc/sc-os/product.env
 

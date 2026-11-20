@@ -10,6 +10,7 @@ case "$1" in
             systemctl daemon-reload || true
         fi
         systemctl enable sc-update.service || true
+        systemctl enable sc-update-check.timer || true
         ;;
 esac
 
