@@ -78,6 +78,32 @@ and Ctrl+Alt+F2 then gives a login prompt.
 
 After editing a settings file, run `sudo sc-os-apply`.
 
+## Updates
+
+`sc-update` keeps two things current and shows the progress on the Plymouth
+splash (orange bar, percentage and a line per stage):
+
+- **The product**: the latest tag (or commit, if untagged) of the product
+  repository, rebuilt and started with docker compose.
+- **The OS packages**: the latest release tag of this repository, built on the
+  machine with `build-sc-os.sh` and installed with apt. A failure of one update
+  does not stop the other.
+
+Both run at boot, before the kiosk. `sc-update --check` only looks, and a timer runs
+it every 6 hours. Read the result with `cat /var/lib/sc-update/status.json`, or
+`sudo sc-update --check` to see it in the journal. `os-update: false` in
+`/etc/sc-update/config.yaml` stops a machine following this repository. Read the
+risks in [docs/decisions/0002-os-updates-and-versioning.md](docs/decisions/0002-os-updates-and-versioning.md).
+
+### Versions
+
+Every commit pushed to `main` is tagged `v<major>.<minor>.<patch>` by
+`.github/workflows/tag.yml`. `<major>.<minor>` is the `VERSION` file; `<patch>` is the
+number of commits since that file last changed. To start a new minor version, edit
+`VERSION` (for example `0.2`): the next commit is `v0.2.0`. A product repository can
+use the same workflow by copying `.github/workflows/tag.yml`, `tools/next_version.py`
+and a `VERSION` file.
+
 ## Private repositories
 
 Use an ssh URL (`REPO_URL` at build time, or `repository-url` in
