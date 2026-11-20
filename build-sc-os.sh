@@ -4,6 +4,7 @@
 #   ./build-sc-os.sh products          list the products
 #   ./build-sc-os.sh debs <product>    build the .deb packages into out/<product>/
 #   ./build-sc-os.sh iso <product>     debs + live-build ISO (needs sudo and a Debian host)
+#   ./build-sc-os.sh update-iso <product>  debs + small ISO with install.sh, to update a machine already deployed
 #   ./build-sc-os.sh config <product>  debs + live-build tree only, in build/<product>/live
 #   ./build-sc-os.sh clean             remove build/ and out/
 #
@@ -297,6 +298,12 @@ pkg_core() {
   if [[ -f "$product_override" ]]; then
     install -Dm0644 "$product_override" "$P/usr/lib/sc-os/$PRODUCT.override.yml"
   fi
+  # Debian only starts Plymouth when "splash" is on the kernel command line.
+  # BOOT_APPEND reaches the live ISO through live-build, but an installed system
+  # boots with GRUB's own defaults, so it is shipped as a drop-in as well.
+  put "$P/etc/default/grub.d/50-sc-os.cfg" <<GRUB
+GRUB_CMDLINE_LINUX_DEFAULT="$BOOT_APPEND"
+GRUB
   if [[ "$PRODUCT" == faculty-screen && -f "$ASSETS_DIR/faculty-screen.env" ]]; then
     install -Dm0640 "$ASSETS_DIR/faculty-screen.env" "$P/etc/sc-os/faculty-screen.env"
   fi
@@ -316,7 +323,7 @@ pkg_kiosk() {
   fi
 
   put "$P/etc/sc-kiosk/kiosk.conf" <<EOF
-# Kiosk session settings (sourced by /usr/libexec/sc-kiosk/session)
+# Kiosk session settings (sourced by /usr/libexec/sc-kiosk/session and wait-ready)
 URL="$PRODUCT_KIOSK_URL"
 WALLPAPER="${WP_NAME:+/usr/share/backgrounds/sc/$WP_NAME}"
 CHROMIUM_FLAGS="$CHROMIUM_EXTRA_FLAGS"
@@ -345,6 +352,26 @@ EOF
   }
   poll();
 </script></body></html>
+EOF
+
+  # Keeps the Plymouth splash on screen until the page answers, then hands the
+  # screen over. Quitting Plymouth as soon as the service starts made the splash
+  # vanish within seconds whenever sc-update finished fast. Plymouth must still
+  # quit before cage starts: it holds the display and cage cannot take it.
+  put "$P/usr/libexec/sc-kiosk/wait-ready" 0755 <<'EOF'
+#!/bin/sh
+URL=http://127.0.0.1:3000/ READY_TIMEOUT_SECONDS=120
+[ -r /etc/sc-kiosk/kiosk.conf ] && . /etc/sc-kiosk/kiosk.conf
+
+waited=0
+until curl --silent --output /dev/null --max-time 2 "$URL"; do
+  waited=$((waited + 2))
+  # Do not hold the splash forever when the product never comes up: the kiosk
+  # then shows its loading page, which keeps polling.
+  [ "$waited" -ge "$READY_TIMEOUT_SECONDS" ] && break
+  sleep 2
+done
+plymouth quit --retain-splash || true
 EOF
 
   put "$P/usr/libexec/sc-kiosk/session" 0755 <<'EOF'
@@ -383,7 +410,7 @@ EOF
   put "$P/usr/lib/systemd/system/sc-kiosk.service" <<EOF
 [Unit]
 Description=Kiosk session (cage + Chromium)
-After=systemd-user-sessions.service plymouth-start.service sc-update.service systemd-logind.service
+After=systemd-user-sessions.service plymouth-start.service sc-os-setup.service sc-update.service systemd-logind.service
 Conflicts=getty@tty1.service plymouth-quit.service
 OnFailure=plymouth-quit.service
 
@@ -400,8 +427,9 @@ StandardError=journal
 UtmpIdentifier=tty1
 UtmpMode=user
 Environment=XDG_SESSION_TYPE=wayland
-ExecStartPre=-+/usr/bin/plymouth quit --retain-splash
+ExecStartPre=+/usr/libexec/sc-kiosk/wait-ready
 ExecStart=/usr/libexec/sc-kiosk/session
+TimeoutStartSec=300
 Restart=always
 RestartSec=2
 
@@ -434,7 +462,7 @@ if [ "$1" = remove ]; then
 fi
 exit 0
 EOF
-  ctl "$P" sc-kiosk "cage, chromium, libpam-systemd, passwd" \
+  ctl "$P" sc-kiosk "cage, chromium, curl, libpam-systemd, passwd" \
     "$OS_NAME kiosk session (cage + Chromium on tty1)" \
     "Recommends: fonts-dejavu-core, libgl1-mesa-dri"
   build_deb "$P"
@@ -495,7 +523,7 @@ if [ -f /etc/os-release.sc ]; then
   rm -f /etc/os-release; mv /etc/os-release.new /etc/os-release; rm /etc/os-release.sc
 fi
 systemctl enable systemd-networkd.service systemd-resolved.service systemd-timesyncd.service
-systemctl enable docker.service sc-os-provision.service sc-update.service
+systemctl enable docker.service sc-os-provision.service sc-os-setup.service sc-update.service
 EOF
   if has_screen; then
     cat >>"$1" <<'EOF'
@@ -608,6 +636,33 @@ cmd_iso() {
   log "ISO ready: out/$PRODUCT/$name"
 }
 
+# Small ISO to update a machine that is already installed: the product's
+# packages plus an install.sh. The updater only follows the product repository,
+# so a fix to the OS packages has to reach the machine this way.
+cmd_update_iso() {
+  command -v xorriso >/dev/null || die "xorriso not found (apt install xorriso)"
+  cmd_debs
+  local stage="$BUILD/update-iso" name
+  rm -rf "$stage"
+  mkdir -p "$stage"
+  cp "$OUT"/sc-*_"${VERSION}"_all.deb "$stage/"
+  put "$stage/install.sh" 0755 <<'EOF'
+#!/bin/sh
+# Installs the Smart Campus packages found next to this script, then reloads systemd.
+set -eu
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root: sudo sh install.sh" >&2; exit 1; }
+cd "$(dirname "$0")"
+apt-get install -y ./*.deb
+systemctl daemon-reload
+echo "Installed. Reboot to apply."
+EOF
+  name="sc-os-update-$PRODUCT-$VERSION.iso"
+  xorriso -as mkisofs -quiet -r -J -V "SC_OS_UPDATE" -o "$OUT/$name" "$stage"
+  log "update ISO ready: out/$PRODUCT/$name"
+  echo "On the machine: sudo mount -o ro /dev/sr0 /mnt && sudo sh /mnt/install.sh && sudo umount /mnt && sudo reboot"
+}
+
 cmd_clean() {
   local SUDO="" live
   [[ $EUID -eq 0 ]] || SUDO="sudo"
@@ -619,7 +674,7 @@ cmd_clean() {
 }
 
 usage() {
-  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -627,6 +682,7 @@ case "${1:-}" in
   products) list_products ;;
   debs)     load_product "${2:-}"; cmd_debs ;;
   iso)      load_product "${2:-}"; cmd_iso ;;
+  update-iso) load_product "${2:-}"; cmd_update_iso ;;
   config)   load_product "${2:-}"; cmd_debs; write_live_config; log "live-build tree in build/$PRODUCT/live" ;;
   clean)    cmd_clean ;;
   *)        usage ;;

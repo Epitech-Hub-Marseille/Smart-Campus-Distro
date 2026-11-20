@@ -2,12 +2,17 @@
 # Setup of the product installed on this machine.
 #   faculty-screen: sc-os-setup [server-url]
 #   central-server: sc-os-setup   (shows where the first admin login is)
+# sc-os-setup --boot is what sc-os-setup.service runs on tty1 before the kiosk
+# starts: it asks until the configuration is written, so a screen can be set up
+# without being able to open another console.
 set -eu
 
 CONFIG_DIR=/etc/sc-os
 FACULTY_ENV="$CONFIG_DIR/faculty-screen.env"
 SERVER_ENV="$CONFIG_DIR/central-server.env"
+VERSION_FILE=/etc/sc-update/version
 CURL_TIMEOUT_SECONDS=10
+RETRY_DELAY_SECONDS=2
 
 # shellcheck source=/dev/null
 . "$CONFIG_DIR/product"
@@ -40,9 +45,11 @@ setup_faculty_screen() {
   server_url="${server_url%/}"
   [ -n "$server_url" ] || fail "a server address is required"
 
-  reply="$(fetch_server_key "$server_url")"
-  public_key="$(printf '%s' "$reply" | json_field publicKey)" || fail "unexpected reply from the server"
-  fingerprint="$(printf '%s' "$reply" | json_field fingerprint)"
+  # Explicit "|| exit 1": inside the boot loop set -e is off, so a failed fetch
+  # would otherwise carry on with an empty reply.
+  reply="$(fetch_server_key "$server_url")" || exit 1
+  public_key="$(printf '%s' "$reply" | json_field publicKey 2>/dev/null)" || fail "unexpected reply from the server"
+  fingerprint="$(printf '%s' "$reply" | json_field fingerprint)" || fail "unexpected reply from the server"
 
   echo "Server key fingerprint: $fingerprint"
   echo "Compare it with the one shown in the console (Devices, Provision a device)."
@@ -56,9 +63,23 @@ SERVER_PUBLIC_KEY=$public_key
 DEVICE_NAME=${device_name:-$(hostname)}
 DISPLAY_PORT=3000
 ENV
-  echo "Written $FACULTY_ENV, starting the update service."
-  systemctl start --no-block sc-update.service
-  echo "The screen shows its own fingerprint: approve it in the console (Devices)."
+  # An empty version makes sc-update redo the update, so a changed setting is
+  # applied to containers that already run.
+  : >"$VERSION_FILE"
+  echo "Written $FACULTY_ENV."
+}
+
+# Runs on tty1 before the kiosk: keeps asking until the setup succeeds.
+# The setup runs in a subshell because fail() exits, and a wrong answer must
+# lead to a new question, not to a machine stuck without a screen.
+setup_faculty_screen_at_boot() {
+  # Plymouth holds the display and would hide the questions.
+  plymouth quit 2>/dev/null || true
+  printf '\n  Smart Campus - first setup of this screen\n\n'
+  until (setup_faculty_screen); do
+    echo "Setup failed, trying again."
+    sleep "$RETRY_DELAY_SECONDS"
+  done
 }
 
 show_central_server() {
@@ -68,8 +89,18 @@ show_central_server() {
   echo "Edit the file, then run: sc-os-apply"
 }
 
+if [ "${1:-}" = --boot ]; then
+  [ "$PRODUCT" = faculty-screen ] || exit 0
+  setup_faculty_screen_at_boot
+  exit 0
+fi
+
 case "$PRODUCT" in
-  faculty-screen) setup_faculty_screen "$@" ;;
+  faculty-screen)
+    setup_faculty_screen "$@"
+    systemctl start --no-block sc-update.service
+    echo "The screen shows its own fingerprint: approve it in the console (Devices)."
+    ;;
   central-server) show_central_server ;;
   *) fail "unknown product '$PRODUCT' in $CONFIG_DIR/product" ;;
 esac

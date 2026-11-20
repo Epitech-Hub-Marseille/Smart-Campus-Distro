@@ -22,7 +22,9 @@ install the right one and stay up to date without rebuilding the OS image.
   owned by uid 1000 because the container runs as `node`. The key is never
   regenerated: losing it means re-provisioning every device.
 - The faculty screen waits for `sc-os-setup` (`required-files` in the updater
-  config). The server key is trusted only after the operator compares its
+  config). `sc-os-setup.service` runs it on tty1 at boot, before `sc-update` and
+  `sc-kiosk`, so a screen can be set up with no second console. Without it the
+  updater stopped at once, the kiosk started and Plymouth quit within seconds. The server key is trusted only after the operator compares its
   fingerprint, as the agent's own documentation requires.
 
 ## Alternatives rejected

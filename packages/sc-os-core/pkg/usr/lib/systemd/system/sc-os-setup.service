@@ -1,0 +1,23 @@
+[Unit]
+Description=Smart Campus first setup (asks on tty1)
+After=network-online.target systemd-user-sessions.service plymouth-start.service
+Wants=network-online.target
+Before=sc-update.service sc-kiosk.service getty.target
+# Runs when the screen has no configuration yet, or when "sc.setup" is added to
+# the kernel command line (edit the boot entry) to configure it again.
+ConditionPathExists=|!/etc/sc-os/faculty-screen.env
+ConditionKernelCommandLine=|sc.setup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/sc-os-setup --boot
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

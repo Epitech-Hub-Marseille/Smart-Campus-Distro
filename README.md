@@ -30,6 +30,7 @@ sudo apt install ./live-build_20250505+deb13u1_all.deb
 ./build-sc-os.sh products
 ./build-sc-os.sh debs faculty-screen    # only the packages, in out/faculty-screen/
 ./build-sc-os.sh iso central-server     # ISO in out/central-server/
+./build-sc-os.sh update-iso faculty-screen   # small ISO to update a machine already deployed
 ```
 
 Settings live in `sc-os.conf` (bash syntax, not
@@ -40,6 +41,11 @@ private repository), `EXTRA_PACKAGES`, `INSTALLER` (`live` installs to disk,
 Assets: `assets/plymouth/` (boot script and logo). Optional: `assets/wallpaper.png`,
 `assets/chime.wav`, and `assets/faculty-screen.env` to ship a ready server address
 and key to every screen.
+
+`update-iso` bundles the packages with an `install.sh`. Mount it on the machine
+(`sudo mount -o ro /dev/sr0 /mnt`), run `sudo sh /mnt/install.sh` and reboot. The
+updater only follows the product repository, so OS-level fixes reach a deployed
+machine this way. Raise `VERSION` in `sc-os.conf` first, or dpkg sees nothing new.
 
 ## Install and first boot
 
@@ -56,10 +62,19 @@ volume, so a live-only boot loses it at every reboot.
    `/etc/sc-os/central-server.env` (root only).
 
 A faculty screen cannot start alone: it needs the address and public key of a
-server. Run `sudo sc-os-setup` on the machine (Ctrl+Alt+F2 on a kiosk), enter the
-server address, and confirm the fingerprint against the console. The updater is
-waiting for `/etc/sc-os/faculty-screen.env` and starts as soon as it exists. The
-screen then shows its own fingerprint to approve in the console.
+server. When `/etc/sc-os/faculty-screen.env` is missing, `sc-os-setup.service`
+asks on tty1 at boot, before the updater and the kiosk start. Enter the server
+address and confirm the fingerprint against the console. A wrong answer or an
+unreachable server asks again. The updater then runs and the kiosk starts, and
+the screen shows its own fingerprint to approve in the console.
+
+To configure a screen again without a shell, edit the boot entry and add
+`sc.setup` to the kernel command line. With a shell, run `sudo sc-os-setup`.
+
+Maintenance shell: the kiosk owns tty1. If Ctrl+Alt+F3 does not switch to a
+console (some hypervisors and remote consoles grab that combination), edit the
+boot entry and add `systemd.unit=multi-user.target`. The kiosk does not start,
+and Ctrl+Alt+F2 then gives a login prompt.
 
 After editing a settings file, run `sudo sc-os-apply`.
 

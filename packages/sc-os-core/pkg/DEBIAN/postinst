@@ -1,7 +1,13 @@
 #!/bin/sh
 set -e
 if [ "$1" = configure ]; then
-  systemctl enable sc-os-provision.service >/dev/null 2>&1 || true
+  systemctl enable sc-os-provision.service sc-os-setup.service >/dev/null 2>&1 || true
   systemctl enable docker.service >/dev/null 2>&1 || true
+  # Applies the drop-in of /etc/default/grub.d. Not in the image build chroot,
+  # which has no GRUB yet: the installer generates the menu there.
+  if [ -d /boot/grub ] && command -v update-grub >/dev/null 2>&1; then
+    # A GRUB problem must not leave the package half configured.
+    update-grub || echo "sc-os-core: update-grub failed, run it by hand" >&2
+  fi
 fi
 exit 0
