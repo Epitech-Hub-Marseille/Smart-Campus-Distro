@@ -123,3 +123,9 @@ Use an ssh URL (`REPO_URL` at build time, or `repository-url` in
 - The updater tests: `python3 -m unittest discover -s tests`.
 
 Why it is built this way: [docs/decisions/0001-products-and-docker.md](docs/decisions/0001-products-and-docker.md).
+
+## License
+
+Released under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, modify and share the
+software for any noncommercial purpose; commercial use, including selling it, is not permitted.
+This is a source-available license, not an open-source one.
